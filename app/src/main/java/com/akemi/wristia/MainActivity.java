@@ -9,6 +9,9 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Message;
 import android.speech.RecognizerIntent;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
@@ -21,6 +24,8 @@ import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -31,9 +36,14 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 
 public class MainActivity extends Activity {
@@ -45,8 +55,7 @@ public class MainActivity extends Activity {
     private static final String KEY_ACCOUNT = "chatgpt_account_label";
     private static final String KEY_DEVICE_ID = "chatgpt_device_id";
 
-    private static final String[] MODEL_SLUGS = {"auto", "gpt-6-2", "gpt-6-2-thinking", "gpt-6-1"};
-    private static final String[] MODEL_NAMES = {"Auto", "Normale", "Ragionato", "6.1"};
+    private static final String[] MODEL_NAMES = {"Auto", "Normale", "Ragionato"};
 
     private static final int SCREEN_HOME = 0;
     private static final int SCREEN_CHAT = 1;
@@ -56,8 +65,12 @@ public class MainActivity extends Activity {
     private int modelIndex = 0;
 
     private FrameLayout rootContainer;
-    private ScrollView activeScrollView;
+    private FrameLayout uiContainer;
+    private WebView bgWebView;
+    private boolean webReady = false;
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
+    private ScrollView activeScrollView;
     private LinearLayout recentListContainer;
     private TextView homeStatusTv;
 
@@ -66,9 +79,9 @@ public class MainActivity extends Activity {
     private Button modelToggleBtn;
     private EditText chatInputBox;
     private Button chatSendBtn;
+    private TextView pendingThinkingTv;
 
     private String activeConversationId = null;
-    private String activeParentNodeId = null;
 
     @Override
     protected void onCreate(final Bundle savedInstanceState) {
@@ -77,13 +90,124 @@ public class MainActivity extends Activity {
 
         rootContainer = new FrameLayout(this);
         rootContainer.setBackgroundColor(Color.BLACK);
+
+        initBackgroundWebView();
+
+        uiContainer = new FrameLayout(this);
+        uiContainer.setBackgroundColor(Color.BLACK);
+        rootContainer.addView(uiContainer, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         setContentView(rootContainer);
 
-        if (getToken().isEmpty()) {
-            showLoginScreen();
-        } else {
+        if (hasActiveSession()) {
             showHomeScreen();
+        } else {
+            showLoginScreen();
         }
+    }
+
+    private boolean hasActiveSession() {
+        final String ck = CookieManager.getInstance().getCookie("https://chatgpt.com");
+        if (ck != null && ck.contains("session-token")) return true;
+        return !getToken().isEmpty();
+    }
+
+    @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
+    private void initBackgroundWebView() {
+        bgWebView = new WebView(this);
+        final WebSettings ws = bgWebView.getSettings();
+        ws.setJavaScriptEnabled(true);
+        ws.setDomStorageEnabled(true);
+        ws.setDatabaseEnabled(true);
+        ws.setJavaScriptCanOpenWindowsAutomatically(true);
+        ws.setSupportMultipleWindows(true);
+
+        String ua = ws.getUserAgentString();
+        if (ua != null) {
+            ua = ua.replace("; wv", "").replaceAll("Version/\\d+\\.\\d+\\s*", "");
+            ws.setUserAgentString(ua);
+        }
+
+        final CookieManager cm = CookieManager.getInstance();
+        cm.setAcceptCookie(true);
+        cm.setAcceptThirdPartyCookies(bgWebView, true);
+
+        bgWebView.addJavascriptInterface(new WebAppBridge(), "AndroidBridge");
+
+        bgWebView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onCreateWindow(
+                    final WebView view,
+                    final boolean isDialog,
+                    final boolean isUserGesture,
+                    final Message resultMsg) {
+                final WebView temp = new WebView(MainActivity.this);
+                temp.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public boolean shouldOverrideUrlLoading(final WebView v, final String url) {
+                        bgWebView.loadUrl(url);
+                        return true;
+                    }
+                });
+                final WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+                transport.setWebView(temp);
+                resultMsg.sendToTarget();
+                return true;
+            }
+        });
+
+        bgWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(final WebView view, final String url) {
+                super.onPageFinished(view, url);
+                cm.flush();
+                if (url != null && url.startsWith("https://chatgpt.com")) {
+                    webReady = true;
+                    probeSessionInWebView();
+                    if (currentScreen == SCREEN_HOME && recentListContainer != null
+                            && recentListContainer.getChildCount() <= 1) {
+                        handler.postDelayed(() -> loadRecentChatsAsync(), 600);
+                    }
+                }
+            }
+        });
+
+        rootContainer.addView(bgWebView, new FrameLayout.LayoutParams(1, 1));
+        bgWebView.loadUrl("https://chatgpt.com/");
+    }
+
+    private void setWebViewFullScreen(final boolean fullScreen) {
+        final FrameLayout.LayoutParams lp;
+        if (fullScreen) {
+            lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+            bgWebView.setAlpha(1f);
+            uiContainer.setVisibility(View.GONE);
+        } else {
+            lp = new FrameLayout.LayoutParams(1, 1);
+            bgWebView.setAlpha(0.01f);
+            uiContainer.setVisibility(View.VISIBLE);
+        }
+        bgWebView.setLayoutParams(lp);
+    }
+
+    private void probeSessionInWebView() {
+        if (bgWebView == null) return;
+        final String js =
+                "(async function(){" +
+                "  try {" +
+                "    const r = await fetch('/api/auth/session', {credentials:'include'});" +
+                "    if (!r.ok) return;" +
+                "    const d = await r.json();" +
+                "    if (d && d.accessToken) {" +
+                "      const did = (d.statsigContext && d.statsigContext.deviceId) || '';" +
+                "      const em = (d.user && d.user.email) || 'ChatGPT Connesso';" +
+                "      AndroidBridge.onSessionDetected(d.accessToken, did, em);" +
+                "    }" +
+                "  } catch(e) {}" +
+                "})();";
+        bgWebView.evaluateJavascript(js, null);
     }
 
     private void ensureOaiDeviceId() {
@@ -108,7 +232,8 @@ public class MainActivity extends Activity {
 
     private void showHomeScreen() {
         currentScreen = SCREEN_HOME;
-        rootContainer.removeAllViews();
+        setWebViewFullScreen(false);
+        uiContainer.removeAllViews();
 
         final LinearLayout root = createCircularScreenRoot();
 
@@ -169,54 +294,87 @@ public class MainActivity extends Activity {
         homeStatusTv.setText(getPrefs().getString(KEY_ACCOUNT, "ChatGPT Connesso"));
         root.addView(homeStatusTv);
 
-        rootContainer.addView(root);
+        uiContainer.addView(root);
         scroll.requestFocus();
 
         loadRecentChatsAsync();
     }
 
     private void loadRecentChatsAsync() {
+        if (recentListContainer == null) return;
         recentListContainer.removeAllViews();
         final TextView loading = new TextView(this);
-        loading.setText("Caricamento chat recenti...");
+        loading.setText(webReady ? "Caricamento chat recenti..." : "Avvio motore ChatGPT...");
         loading.setTextColor(Color.parseColor("#94A3B8"));
         loading.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         loading.setPadding(dp(4), dp(12), dp(4), dp(12));
         recentListContainer.addView(loading);
 
-        final String token = getToken();
-        final String devId = getOaiDeviceId();
-        final String cookies = getCookies();
-
-        new Thread(() -> {
-            try {
-                final List<ChatGptClient.ChatSummary> items =
-                        ChatGptClient.fetchRecentChats(token, devId, cookies);
-                runOnUiThread(() -> {
-                    recentListContainer.removeAllViews();
-                    if (items.isEmpty()) {
-                        final TextView empty = new TextView(this);
-                        empty.setText("Nessuna chat recente trovata. Tocca Nuova Chat per iniziare!");
-                        empty.setTextColor(Color.GRAY);
-                        empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-                        recentListContainer.addView(empty);
-                        return;
-                    }
-                    for (final ChatGptClient.ChatSummary item : items) {
-                        addRecentChatCard(item);
-                    }
-                });
-            } catch (final Exception e) {
-                runOnUiThread(() -> {
-                    recentListContainer.removeAllViews();
-                    final TextView err = new TextView(this);
-                    err.setText("Sessione scaduta o errore rete:\n" + e.getMessage() + "\n\nTocca 🔑 in alto per aggiornare il token.");
-                    err.setTextColor(Color.parseColor("#F87171"));
-                    err.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-                    recentListContainer.addView(err);
-                });
+        if (!webReady) {
+            if (bgWebView != null && (bgWebView.getUrl() == null || !bgWebView.getUrl().startsWith("https://chatgpt.com"))) {
+                bgWebView.loadUrl("https://chatgpt.com/");
             }
-        }).start();
+            return;
+        }
+
+        final String js =
+                "(async function(){" +
+                "  try {" +
+                "    const s = await fetch('/api/auth/session', {credentials:'include'}).then(r=>r.json());" +
+                "    const tok = (s && s.accessToken) || " + JSONObject.quote(getToken()) + ";" +
+                "    const did = (s && s.statsigContext && s.statsigContext.deviceId) || " + JSONObject.quote(getOaiDeviceId()) + ";" +
+                "    if (s && s.accessToken) {" +
+                "      AndroidBridge.onSessionDetected(tok, did, (s.user && s.user.email) || 'ChatGPT Connesso');" +
+                "    }" +
+                "    const r = await fetch('/backend-api/conversations?offset=0&limit=25&order=updated', {" +
+                "      credentials: 'include'," +
+                "      headers: { 'Authorization': 'Bearer ' + tok, 'oai-device-id': did, 'oai-language': 'it-IT' }" +
+                "    });" +
+                "    const txt = await r.text();" +
+                "    AndroidBridge.onChatsJson(r.status, txt);" +
+                "  } catch(e) {" +
+                "    AndroidBridge.onChatsJson(0, String(e));" +
+                "  }" +
+                "})();";
+        bgWebView.evaluateJavascript(js, null);
+    }
+
+    private void handleWebChatsResult(final int status, final String body) {
+        if (recentListContainer == null || currentScreen != SCREEN_HOME) return;
+        recentListContainer.removeAllViews();
+        if (status == 200) {
+            try {
+                final JSONObject root = new JSONObject(body);
+                final JSONArray items = root.optJSONArray("items");
+                if (items == null || items.length() == 0) {
+                    final TextView empty = new TextView(this);
+                    empty.setText("Nessuna chat recente trovata. Tocca Nuova Chat per iniziare!");
+                    empty.setTextColor(Color.GRAY);
+                    empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                    recentListContainer.addView(empty);
+                    return;
+                }
+                for (int i = 0; i < items.length(); i++) {
+                    final JSONObject it = items.optJSONObject(i);
+                    if (it == null) continue;
+                    final String id = it.optString("id", "");
+                    String title = it.optString("title", "Nuova chat").trim();
+                    if (title.isEmpty() || "null".equalsIgnoreCase(title)) title = "Chat senza titolo";
+                    String updated = it.optString("update_time", "");
+                    if (updated.length() >= 10) updated = updated.substring(0, 10);
+                    if (!id.isEmpty()) {
+                        addRecentChatCard(new ChatGptClient.ChatSummary(id, title, updated));
+                    }
+                }
+                return;
+            } catch (final Exception ignored) {}
+        }
+
+        final TextView err = new TextView(this);
+        err.setText("Sessione non attiva (HTTP " + status + ").\nTocca 🔑 in alto per accedere direttamente dall'orologio.");
+        err.setTextColor(Color.parseColor("#F87171"));
+        err.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        recentListContainer.addView(err);
     }
 
     private void addRecentChatCard(final ChatGptClient.ChatSummary item) {
@@ -256,17 +414,25 @@ public class MainActivity extends Activity {
         card.setOnLongClickListener(v -> {
             new AlertDialog.Builder(this)
                     .setTitle(item.title)
-                    .setMessage("Vuoi archiviare/nascondere questa chat?")
-                    .setPositiveButton("Nascondi", (d, w) -> new Thread(() -> {
-                        final boolean ok = ChatGptClient.hideConversation(
-                                getToken(), getOaiDeviceId(), getCookies(), item.id);
-                        runOnUiThread(() -> {
-                            if (ok) {
-                                recentListContainer.removeView(card);
-                                Toast.makeText(this, "Chat nascosta", Toast.LENGTH_SHORT).show();
-                            }
-                        });
-                    }).start())
+                    .setMessage("Vuoi nascondere questa chat?")
+                    .setPositiveButton("Nascondi", (d, w) -> {
+                        final String js =
+                                "(async function(){" +
+                                "  try {" +
+                                "    const s = await fetch('/api/auth/session', {credentials:'include'}).then(r=>r.json());" +
+                                "    const tok = (s && s.accessToken) || " + JSONObject.quote(getToken()) + ";" +
+                                "    const did = (s && s.statsigContext && s.statsigContext.deviceId) || " + JSONObject.quote(getOaiDeviceId()) + ";" +
+                                "    await fetch('/backend-api/conversation/" + item.id + "', {" +
+                                "      method: 'PATCH', credentials: 'include'," +
+                                "      headers: { 'Content-Type':'application/json', 'Authorization': 'Bearer ' + tok, 'oai-device-id': did }," +
+                                "      body: JSON.stringify({is_visible: false})" +
+                                "    });" +
+                                "  } catch(e) {}" +
+                                "})();";
+                        bgWebView.evaluateJavascript(js, null);
+                        recentListContainer.removeView(card);
+                        Toast.makeText(this, "Chat nascosta", Toast.LENGTH_SHORT).show();
+                    })
                     .setNegativeButton("Annulla", null)
                     .show();
             return true;
@@ -277,44 +443,103 @@ public class MainActivity extends Activity {
 
     private void openNewChat() {
         activeConversationId = null;
-        activeParentNodeId = null;
+        if (bgWebView != null) {
+            bgWebView.loadUrl("https://chatgpt.com/");
+        }
         buildChatScreen("Nuova Chat");
         addMessageBubble("Ciao! Sono connesso al tuo account ChatGPT. Chiedimi qualsiasi cosa con 🎤 o tastiera.", false);
     }
 
     private void openExistingChat(final ChatGptClient.ChatSummary summary) {
         activeConversationId = summary.id;
-        activeParentNodeId = null;
+        if (bgWebView != null) {
+            bgWebView.loadUrl("https://chatgpt.com/c/" + summary.id);
+        }
         buildChatScreen(summary.title);
-        final TextView loadingTv = addMessageBubble("Caricamento messaggi...", false);
+        pendingThinkingTv = addMessageBubble("Caricamento messaggi...", false);
 
-        new Thread(() -> {
+        final String js =
+                "(async function(){" +
+                "  try {" +
+                "    const s = await fetch('/api/auth/session', {credentials:'include'}).then(r=>r.json());" +
+                "    const tok = (s && s.accessToken) || " + JSONObject.quote(getToken()) + ";" +
+                "    const did = (s && s.statsigContext && s.statsigContext.deviceId) || " + JSONObject.quote(getOaiDeviceId()) + ";" +
+                "    const r = await fetch('/backend-api/conversation/" + summary.id + "', {" +
+                "      credentials: 'include'," +
+                "      headers: { 'Authorization': 'Bearer ' + tok, 'oai-device-id': did, 'oai-language': 'it-IT' }" +
+                "    });" +
+                "    const txt = await r.text();" +
+                "    AndroidBridge.onConversationJson(r.status, " + JSONObject.quote(summary.id) + ", txt);" +
+                "  } catch(e) {" +
+                "    AndroidBridge.onConversationJson(0, " + JSONObject.quote(summary.id) + ", String(e));" +
+                "  }" +
+                "})();";
+        bgWebView.evaluateJavascript(js, null);
+    }
+
+    private void handleWebConversationResult(final int status, final String convId, final String body) {
+        if (currentScreen != SCREEN_CHAT || chatMessagesContainer == null) return;
+        if (pendingThinkingTv != null) {
+            chatMessagesContainer.removeView(pendingThinkingTv);
+            pendingThinkingTv = null;
+        }
+        if (status == 200) {
             try {
-                final ChatGptClient.ConversationDetail detail = ChatGptClient.fetchConversationDetail(
-                        getToken(), getOaiDeviceId(), getCookies(), summary.id);
-                runOnUiThread(() -> {
-                    chatMessagesContainer.removeView(loadingTv);
-                    activeParentNodeId = detail.lastNodeId;
-                    if (detail.messages.isEmpty()) {
-                        addMessageBubble("Chat vuota. Scrivi un messaggio qui sotto!", false);
-                    } else {
-                        for (final ChatGptClient.ChatMessage m : detail.messages) {
-                            addMessageBubble(m.text, "user".equals(m.role));
+                final JSONObject root = new JSONObject(body);
+                final String currentNode = root.optString("current_node", "");
+                final JSONObject mapping = root.optJSONObject("mapping");
+                final List<ChatGptClient.ChatMessage> msgs = new ArrayList<>();
+                if (mapping != null && !currentNode.isEmpty()) {
+                    String cursor = currentNode;
+                    final Set<String> visited = new HashSet<>();
+                    while (cursor != null && !cursor.isEmpty() && !visited.contains(cursor)) {
+                        visited.add(cursor);
+                        final JSONObject node = mapping.optJSONObject(cursor);
+                        if (node == null) break;
+                        final JSONObject msgObj = node.optJSONObject("message");
+                        if (msgObj != null) {
+                            final JSONObject author = msgObj.optJSONObject("author");
+                            final String role = author != null ? author.optString("role", "") : "";
+                            final JSONObject content = msgObj.optJSONObject("content");
+                            if (content != null && ("user".equals(role) || "assistant".equals(role))) {
+                                final JSONArray parts = content.optJSONArray("parts");
+                                if (parts != null) {
+                                    final StringBuilder sb = new StringBuilder();
+                                    for (int i = 0; i < parts.length(); i++) {
+                                        final Object item = parts.opt(i);
+                                        if (item instanceof String) {
+                                            if (sb.length() > 0) sb.append("\n");
+                                            sb.append((String) item);
+                                        }
+                                    }
+                                    final String t = sb.toString().trim();
+                                    if (!t.isEmpty()) {
+                                        msgs.add(new ChatGptClient.ChatMessage(role, t));
+                                    }
+                                }
+                            }
                         }
+                        cursor = node.isNull("parent") ? null : node.optString("parent", null);
                     }
-                });
-            } catch (final Exception e) {
-                runOnUiThread(() -> {
-                    chatMessagesContainer.removeView(loadingTv);
-                    addMessageBubble("Errore caricamento cronologia: " + e.getMessage(), false);
-                });
-            }
-        }).start();
+                    Collections.reverse(msgs);
+                }
+                if (msgs.isEmpty()) {
+                    addMessageBubble("Chat vuota. Scrivi un messaggio qui sotto!", false);
+                } else {
+                    for (final ChatGptClient.ChatMessage m : msgs) {
+                        addMessageBubble(m.text, "user".equals(m.role));
+                    }
+                }
+                return;
+            } catch (final Exception ignored) {}
+        }
+        addMessageBubble("Errore apertura chat (HTTP " + status + "). Riprova tra poco.", false);
     }
 
     private void buildChatScreen(final String title) {
         currentScreen = SCREEN_CHAT;
-        rootContainer.removeAllViews();
+        setWebViewFullScreen(false);
+        uiContainer.removeAllViews();
 
         final LinearLayout root = createCircularScreenRoot();
 
@@ -341,7 +566,7 @@ public class MainActivity extends Activity {
 
         modelToggleBtn = makePillBtn(MODEL_NAMES[modelIndex], "#064E3B", Color.parseColor("#34D399"));
         modelToggleBtn.setOnClickListener(v -> {
-            modelIndex = (modelIndex + 1) % MODEL_SLUGS.length;
+            modelIndex = (modelIndex + 1) % MODEL_NAMES.length;
             modelToggleBtn.setText(MODEL_NAMES[modelIndex]);
             Toast.makeText(this, "Modalità: " + MODEL_NAMES[modelIndex], Toast.LENGTH_SHORT).show();
         });
@@ -394,7 +619,7 @@ public class MainActivity extends Activity {
         botBar.addView(chatSendBtn);
 
         root.addView(botBar);
-        rootContainer.addView(root);
+        uiContainer.addView(root);
         scroll.requestFocus();
     }
 
@@ -404,32 +629,103 @@ public class MainActivity extends Activity {
         chatInputBox.setText("");
         addMessageBubble(text, true);
 
-        final TextView thinkingTv = addMessageBubble("ChatGPT sta scrivendo...", false);
+        pendingThinkingTv = addMessageBubble("ChatGPT sta scrivendo...", false);
         chatSendBtn.setEnabled(false);
 
-        final String token = getToken();
-        final String devId = getOaiDeviceId();
-        final String cookies = getCookies();
-        final String convId = activeConversationId;
-        final String parentId = activeParentNodeId;
-        final String model = MODEL_SLUGS[modelIndex];
+        if ("Nuova Chat".equals(chatHeaderTitleTv.getText().toString())) {
+            chatHeaderTitleTv.setText(text);
+        }
 
-        new Thread(() -> {
-            final ChatGptClient.SendResult res = ChatGptClient.sendMessage(
-                    token, devId, cookies, convId, parentId, model, text);
-            runOnUiThread(() -> {
-                chatMessagesContainer.removeView(thinkingTv);
-                addMessageBubble(res.replyText, false);
-                if (res.ok) {
-                    activeConversationId = res.conversationId;
-                    activeParentNodeId = res.assistantMessageId;
-                    if ("Nuova Chat".equals(chatHeaderTitleTv.getText().toString())) {
-                        chatHeaderTitleTv.setText(text);
-                    }
-                }
-                chatSendBtn.setEnabled(true);
-            });
-        }).start();
+        final String quotedMsg = JSONObject.quote(text);
+        final String js =
+                "(function(){" +
+                "  const msgText = " + quotedMsg + ";" +
+                "  let tries = 0;" +
+                "  function attemptSend() {" +
+                "    const el = document.querySelector('#prompt-textarea')" +
+                "      || document.querySelector('div[contenteditable=\"true\"]')" +
+                "      || document.querySelector('textarea');" +
+                "    if (!el) {" +
+                "      if (++tries < 25) { setTimeout(attemptSend, 350); return; }" +
+                "      AndroidBridge.onSendResult(false, 'Pagina ChatGPT non pronta. Tocca 🔑 e verifica il login.', '');" +
+                "      return;" +
+                "    }" +
+                "    const prevCount = document.querySelectorAll('[data-message-author-role=\"assistant\"]').length;" +
+                "    el.focus();" +
+                "    if (el.tagName === 'TEXTAREA') {" +
+                "      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;" +
+                "      setter.call(el, msgText);" +
+                "      el.dispatchEvent(new Event('input', { bubbles: true }));" +
+                "    } else {" +
+                "      document.execCommand('selectAll', false, null);" +
+                "      document.execCommand('insertText', false, msgText);" +
+                "      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: msgText, inputType: 'insertText' }));" +
+                "    }" +
+                "    setTimeout(function(){" +
+                "      const btn = document.querySelector('button[data-testid=\"send-button\"]')" +
+                "        || document.querySelector('button[aria-label*=\"Invia\"]')" +
+                "        || document.querySelector('button[aria-label*=\"Send\"]');" +
+                "      if (btn && !btn.disabled) {" +
+                "        btn.click();" +
+                "      } else {" +
+                "        el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));" +
+                "      }" +
+                "      let polls = 0;" +
+                "      let lastTxt = '';" +
+                "      let stableTicks = 0;" +
+                "      const timer = setInterval(function(){" +
+                "        polls++;" +
+                "        const nodes = document.querySelectorAll('[data-message-author-role=\"assistant\"]');" +
+                "        if (nodes.length > prevCount) {" +
+                "          const last = nodes[nodes.length - 1];" +
+                "          const cur = (last.innerText || last.textContent || '').trim();" +
+                "          const stopBtn = document.querySelector('button[data-testid=\"stop-button\"]')" +
+                "            || document.querySelector('button[aria-label*=\"Interrompi\"]')" +
+                "            || document.querySelector('button[aria-label*=\"Stop\"]');" +
+                "          if (cur.length > 0 && !stopBtn && cur === lastTxt) {" +
+                "            stableTicks++;" +
+                "          } else {" +
+                "            stableTicks = 0;" +
+                "          }" +
+                "          lastTxt = cur;" +
+                "          if (stableTicks >= 2 || polls > 140) {" +
+                "            clearInterval(timer);" +
+                "            const m = window.location.pathname.match(/\\/c\\/([a-zA-Z0-9-]+)/);" +
+                "            AndroidBridge.onSendResult(true, cur || 'Risposta ricevuta.', m ? m[1] : '');" +
+                "          }" +
+                "        } else if (polls > 16) {" +
+                "          const alertEl = document.querySelector('[role=\"alert\"]');" +
+                "          if (alertEl && alertEl.innerText) {" +
+                "            clearInterval(timer);" +
+                "            AndroidBridge.onSendResult(false, alertEl.innerText.trim(), '');" +
+                "            return;" +
+                "          }" +
+                "          if (polls > 70) {" +
+                "            clearInterval(timer);" +
+                "            AndroidBridge.onSendResult(false, 'Tempo scaduto in attesa della risposta di ChatGPT.', '');" +
+                "          }" +
+                "        }" +
+                "      }, 500);" +
+                "    }, 250);" +
+                "  }" +
+                "  attemptSend();" +
+                "})();";
+        bgWebView.evaluateJavascript(js, null);
+    }
+
+    private void handleWebSendResult(final boolean ok, final String replyText, final String convId) {
+        if (currentScreen != SCREEN_CHAT || chatMessagesContainer == null) return;
+        if (pendingThinkingTv != null) {
+            chatMessagesContainer.removeView(pendingThinkingTv);
+            pendingThinkingTv = null;
+        }
+        addMessageBubble(replyText, false);
+        if (ok && convId != null && !convId.isEmpty()) {
+            activeConversationId = convId;
+        }
+        if (chatSendBtn != null) {
+            chatSendBtn.setEnabled(true);
+        }
     }
 
     private TextView addMessageBubble(final String msg, final boolean isUser) {
@@ -459,188 +755,96 @@ public class MainActivity extends Activity {
 
     private void showLoginScreen() {
         currentScreen = SCREEN_LOGIN;
-        rootContainer.removeAllViews();
+        uiContainer.removeAllViews();
+        setWebViewFullScreen(true);
 
-        final LinearLayout root = createCircularScreenRoot();
-
-        final ScrollView scroll = new ScrollView(this);
-        scroll.setFocusable(true);
-        scroll.setFocusableInTouchMode(true);
-        scroll.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        activeScrollView = scroll;
-
-        final LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        scroll.addView(box);
-
-        final TextView hdr = new TextView(this);
-        hdr.setText("Login ChatGPT");
-        hdr.setTextColor(Color.parseColor("#34D399"));
-        hdr.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        hdr.setTypeface(null, Typeface.BOLD);
-        box.addView(hdr);
-
-        final TextView desc = new TextView(this);
-        desc.setText("1. Apri chatgpt.com/api/auth/session su telefono o PC.\n2. Copia e incolla qui sotto il testo o accessToken (eyJ...):");
-        desc.setTextColor(Color.parseColor("#CBD5E1"));
-        desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        desc.setPadding(0, dp(4), 0, dp(6));
-        box.addView(desc);
-
-        final EditText tokenInput = new EditText(this);
-        tokenInput.setHint("Incolla JSON o eyJ...");
-        tokenInput.setTextColor(Color.WHITE);
-        tokenInput.setHintTextColor(Color.GRAY);
-        tokenInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        tokenInput.setSingleLine(true);
-        tokenInput.setText(getToken());
-        box.addView(tokenInput);
-
-        final TextView statusTv = new TextView(this);
-        statusTv.setTextColor(Color.parseColor("#38BDF8"));
-        statusTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        statusTv.setPadding(0, dp(4), 0, dp(4));
-        box.addView(statusTv);
-
-        final Button saveBtn = new Button(this);
-        saveBtn.setText("✅ Verifica e Entra");
-        saveBtn.setTextColor(Color.WHITE);
-        saveBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        final GradientDrawable saveBg = new GradientDrawable();
-        saveBg.setCornerRadius(dp(12));
-        saveBg.setColor(Color.parseColor("#10A37F"));
-        saveBtn.setBackground(saveBg);
-        saveBtn.setOnClickListener(v -> {
-            final String extracted = ChatGptClient.extractToken(tokenInput.getText().toString());
-            if (extracted.isEmpty()) {
-                statusTv.setText("Incolla un token valido.");
-                return;
-            }
-            saveBtn.setEnabled(false);
-            statusTv.setText("Verifica account...");
-            new Thread(() -> {
-                try {
-                    final String label = ChatGptClient.verifyAndFetchAccountLabel(
-                            extracted, getOaiDeviceId(), getCookies());
-                    getPrefs().edit()
-                            .putString(KEY_TOKEN, extracted)
-                            .putString(KEY_ACCOUNT, label)
-                            .apply();
-                    runOnUiThread(() -> {
-                        Toast.makeText(this, "Connesso: " + label, Toast.LENGTH_SHORT).show();
-                        showHomeScreen();
-                    });
-                } catch (final Exception e) {
-                    runOnUiThread(() -> {
-                        saveBtn.setEnabled(true);
-                        statusTv.setText("Errore: " + e.getMessage());
-                    });
-                }
-            }).start();
-        });
-        box.addView(saveBtn);
-
-        final Button webBtn = new Button(this);
-        webBtn.setText("🌐 Prova Login Browser");
-        webBtn.setTextColor(Color.WHITE);
-        webBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        final GradientDrawable webBg = new GradientDrawable();
-        webBg.setCornerRadius(dp(12));
-        webBg.setColor(Color.parseColor("#1E293B"));
-        webBtn.setBackground(webBg);
-        final LinearLayout.LayoutParams webLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        webLp.topMargin = dp(6);
-        webBtn.setLayoutParams(webLp);
-        webBtn.setOnClickListener(v -> openEmbeddedWebLogin());
-        box.addView(webBtn);
-
-        if (!getToken().isEmpty()) {
-            final LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            final LinearLayout.LayoutParams rLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            rLp.topMargin = dp(6);
-            row.setLayoutParams(rLp);
-
-            final Button backHomeBtn = makePillBtn("← Torna", "#334155", Color.WHITE);
-            backHomeBtn.setOnClickListener(v -> showHomeScreen());
-            row.addView(backHomeBtn);
-
-            final Button logoutBtn = makePillBtn("Esci", "#7F1D1D", Color.WHITE);
-            logoutBtn.setOnClickListener(v -> {
-                getPrefs().edit().remove(KEY_TOKEN).remove(KEY_COOKIES).remove(KEY_ACCOUNT).apply();
-                Toast.makeText(this, "Disconnesso", Toast.LENGTH_SHORT).show();
-                showLoginScreen();
-            });
-            row.addView(logoutBtn);
-            box.addView(row);
+        if (bgWebView.getUrl() == null || !bgWebView.getUrl().startsWith("https://chatgpt.com")) {
+            bgWebView.loadUrl("https://chatgpt.com/");
         }
 
-        root.addView(scroll);
-        rootContainer.addView(root);
-        scroll.requestFocus();
+        final LinearLayout overlayBar = new LinearLayout(this);
+        overlayBar.setOrientation(LinearLayout.HORIZONTAL);
+        overlayBar.setGravity(Gravity.CENTER);
+        overlayBar.setPadding(dp(16), dp(14), dp(16), dp(4));
+
+        final Button backBtn = makePillBtn("←", "#334155", Color.WHITE);
+        backBtn.setOnClickListener(v -> showHomeScreen());
+        overlayBar.addView(backBtn);
+
+        final Button doneBtn = makePillBtn("✅ Entra", "#10A37F", Color.WHITE);
+        doneBtn.setOnClickListener(v -> {
+            probeSessionInWebView();
+            showHomeScreen();
+        });
+        overlayBar.addView(doneBtn);
+
+        final Button logoutBtn = makePillBtn("Esci", "#7F1D1D", Color.WHITE);
+        logoutBtn.setOnClickListener(v -> {
+            CookieManager.getInstance().removeAllCookies(null);
+            CookieManager.getInstance().flush();
+            getPrefs().edit().clear().apply();
+            bgWebView.loadUrl("https://chatgpt.com/");
+            Toast.makeText(this, "Sessione azzerata", Toast.LENGTH_SHORT).show();
+        });
+        overlayBar.addView(logoutBtn);
+
+        final FrameLayout.LayoutParams barLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        barLp.gravity = Gravity.TOP;
+        rootContainer.addView(overlayBar, barLp);
+
+        startLoginAutoCheck(overlayBar);
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private void openEmbeddedWebLogin() {
-        try {
-            rootContainer.removeAllViews();
-            final LinearLayout wrap = new LinearLayout(this);
-            wrap.setOrientation(LinearLayout.VERTICAL);
-            wrap.setBackgroundColor(Color.BLACK);
+    private void startLoginAutoCheck(final View overlayBar) {
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (currentScreen != SCREEN_LOGIN) {
+                    rootContainer.removeView(overlayBar);
+                    return;
+                }
+                probeSessionInWebView();
+                handler.postDelayed(this, 2500);
+            }
+        }, 2500);
+    }
 
-            final LinearLayout bar = new LinearLayout(this);
-            bar.setOrientation(LinearLayout.HORIZONTAL);
-            bar.setGravity(Gravity.CENTER);
-            bar.setPadding(dp(12), dp(14), dp(12), dp(4));
+    private final class WebAppBridge {
+        @JavascriptInterface
+        public void onSessionDetected(final String token, final String deviceId, final String email) {
+            runOnUiThread(() -> {
+                if (token != null && !token.isEmpty()) {
+                    final SharedPreferences.Editor ed = getPrefs().edit().putString(KEY_TOKEN, token);
+                    if (deviceId != null && !deviceId.isEmpty()) {
+                        ed.putString(KEY_DEVICE_ID, deviceId);
+                    }
+                    if (email != null && !email.isEmpty()) {
+                        ed.putString(KEY_ACCOUNT, email);
+                    }
+                    ed.apply();
+                    CookieManager.getInstance().flush();
+                    if (currentScreen == SCREEN_LOGIN) {
+                        Toast.makeText(MainActivity.this, "Connesso!", Toast.LENGTH_SHORT).show();
+                        showHomeScreen();
+                    }
+                }
+            });
+        }
 
-            final WebView webView = new WebView(this);
-            final WebSettings ws = webView.getSettings();
-            ws.setJavaScriptEnabled(true);
-            ws.setDomStorageEnabled(true);
+        @JavascriptInterface
+        public void onChatsJson(final int status, final String body) {
+            runOnUiThread(() -> handleWebChatsResult(status, body));
+        }
 
-            final Button cancelBtn = makePillBtn("✕", "#334155", Color.WHITE);
-            cancelBtn.setOnClickListener(v -> showLoginScreen());
-            bar.addView(cancelBtn);
+        @JavascriptInterface
+        public void onConversationJson(final int status, final String convId, final String body) {
+            runOnUiThread(() -> handleWebConversationResult(status, convId, body));
+        }
 
-            final Button grabBtn = makePillBtn("✅ Ho fatto login", "#10A37F", Color.WHITE);
-            grabBtn.setOnClickListener(v -> webView.evaluateJavascript(
-                    "(function(){try{var x=new XMLHttpRequest();x.open('GET','/api/auth/session',false);x.send(null);return x.responseText;}catch(e){return '';}})()",
-                    value -> {
-                        String unescaped = value == null ? "" : value.trim();
-                        if (unescaped.startsWith("\"") && unescaped.endsWith("\"") && unescaped.length() >= 2) {
-                            unescaped = unescaped.substring(1, unescaped.length() - 1);
-                        }
-                        unescaped = unescaped.replace("\\\"", "\"");
-                        final String tok = ChatGptClient.extractToken(unescaped);
-                        final String ck = CookieManager.getInstance().getCookie("https://chatgpt.com");
-                        if (!tok.isEmpty()) {
-                            getPrefs().edit()
-                                    .putString(KEY_TOKEN, tok)
-                                    .putString(KEY_COOKIES, ck == null ? "" : ck)
-                                    .putString(KEY_ACCOUNT, "ChatGPT Web Login")
-                                    .apply();
-                            Toast.makeText(this, "Sessione catturata!", Toast.LENGTH_SHORT).show();
-                            showHomeScreen();
-                        } else {
-                            Toast.makeText(this, "Completa prima il login nella pagina", Toast.LENGTH_SHORT).show();
-                        }
-                    }));
-            bar.addView(grabBtn);
-
-            wrap.addView(bar);
-            webView.setLayoutParams(new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-            webView.setWebViewClient(new WebViewClient());
-            webView.loadUrl("https://chatgpt.com");
-            wrap.addView(webView);
-
-            rootContainer.addView(wrap);
-        } catch (final Throwable t) {
-            Toast.makeText(this, "Browser non presente su questo orologio: usa il Token.", Toast.LENGTH_LONG).show();
-            showLoginScreen();
+        @JavascriptInterface
+        public void onSendResult(final boolean ok, final String replyText, final String convId) {
+            runOnUiThread(() -> handleWebSendResult(ok, replyText, convId));
         }
     }
 
@@ -686,7 +890,7 @@ public class MainActivity extends Activity {
     public void onBackPressed() {
         if (currentScreen == SCREEN_CHAT) {
             showHomeScreen();
-        } else if (currentScreen == SCREEN_LOGIN && !getToken().isEmpty()) {
+        } else if (currentScreen == SCREEN_LOGIN && hasActiveSession()) {
             showHomeScreen();
         } else {
             super.onBackPressed();
@@ -716,10 +920,6 @@ public class MainActivity extends Activity {
 
     private String getToken() {
         return getPrefs().getString(KEY_TOKEN, "").trim();
-    }
-
-    private String getCookies() {
-        return getPrefs().getString(KEY_COOKIES, "").trim();
     }
 
     private String getOaiDeviceId() {
